@@ -4,7 +4,8 @@
 import argparse
 from pathlib import Path
 import sys
-import re  # For natural sorting
+import re
+from os import path
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from scipy.stats import zscore
 
 PLOT_Y_LIM = 7.5
 GENE_ANNOTATION_PADDING = 0
+GENE_MERGE_DISTANCE = 2_000_000
 
 # Default paths
 DEFAULT_CYTOBAND_PATH = Path('input/static/cytoBand.txt')
@@ -70,10 +72,10 @@ def load_and_preprocess_cytoband(file_path):
 
 
 def calculate_chromosome_features(cytoband_df):
-    """Calculates chromosome lengths and absolute start positions, sorted naturally."""
+    """Calculates chromosome lengths, absolute starts, and p/q arm boundaries."""
     if cytoband_df.empty:
         print("Warning: Cytoband data is empty, cannot calculate chromosome features.", file=sys.stderr)
-        return pd.DataFrame(columns=['chromosome', 'length', 'chromosome_absolute_start']), {}
+        return pd.DataFrame(columns=['chromosome', 'length', 'chromosome_absolute_start']), {}, []
 
     # Ensure chromosome column is string before grouping
     cytoband_df['chromosome'] = cytoband_df['chromosome'].astype(str)
@@ -89,7 +91,20 @@ def calculate_chromosome_features(cytoband_df):
 
     chromosomes_df['chromosome_absolute_start'] = chromosomes_df['length'].cumsum() - chromosomes_df['length']
     chromosome_start_map = chromosomes_df.set_index('chromosome')['chromosome_absolute_start'].to_dict()
-    return chromosomes_df, chromosome_start_map
+
+    # Find the end of the p-arm (centromere start) for each chromosome.
+    arm_boundaries = []
+    p_arm_data = cytoband_df[cytoband_df['band'].str.startswith('p', na=False)]
+    if not p_arm_data.empty:
+        p_arm_ends = p_arm_data.groupby('chromosome').agg(p_arm_end_pos=('end', 'max'))
+
+        # Calculate the absolute genomic position for each boundary
+        for chrom, row in p_arm_ends.iterrows():
+            if chrom in chromosome_start_map:
+                absolute_boundary = chromosome_start_map[chrom] + row['p_arm_end_pos']
+                arm_boundaries.append(absolute_boundary)
+
+    return chromosomes_df, chromosome_start_map, arm_boundaries
 
 
 def load_and_preprocess_relevant_genes(file_path):
@@ -150,10 +165,8 @@ def load_ngs_cnr_file(cnr_filepath, case_identifier):
         return None, np.nan, np.nan
 
     df['case_identifier'] = case_identifier
-    df = df.drop(columns=['gene'], errors='ignore')
-    # Chromosome already string, no need for _sanitize_chromosome_column
 
-    if df.empty:  # Should check after ensuring chromosome is string and before other operations
+    if df.empty:
         print(f"Warning: No data in {cnr_filepath.name} after initial load.", file=sys.stderr)
         return None, np.nan, np.nan
 
@@ -166,6 +179,9 @@ def load_ngs_cnr_file(cnr_filepath, case_identifier):
         print(f"Warning: No data left in {cnr_filepath.name} after dropping NaNs in key columns (incl. log2).",
               file=sys.stderr)
         return None, np.nan, np.nan
+
+    is_antitarget = (df['gene'] == 'Antitarget')
+    df.loc[is_antitarget, 'gene'] = pd.NA
 
     original_log2_series = df['log2'].copy()
     cnr_original_mean = np.nan
@@ -257,36 +273,43 @@ def load_cns_file(cns_filepath: Path, chromosome_start_map: dict,
     return df
 
 
-def annotate_segments_with_genes(df, gene_interval_trees, padding=GENE_ANNOTATION_PADDING):
-    """Annotates DataFrame segments with overlapping genes. df['chromosome'] is string."""
-    if df.empty or not gene_interval_trees:
-        df['gene'] = None  # Add gene column even if empty
+def annotate_segments_with_genes(df, gene_interval_trees, genes_df, padding=GENE_ANNOTATION_PADDING):
+    """Annotates DataFrame segments with overlapping genes."""
+    if df.empty:
+        if 'gene' not in df.columns:
+            df['gene'] = pd.NA
         return df
 
-    gene_annotations = []
-    # Ensure chromosome column is string for row access
+    all_relevant_genes = set(genes_df['gene'])
     df['chromosome'] = df['chromosome'].astype(str)
 
-    for _, row in df.iterrows():
-        chrom = row.chromosome  # Already string
+    # Identify valid "panel genes" already in the dataframe. These will be excluded from the search.
+    is_not_na = df['gene'].notna()
+    is_valid = df['gene'].isin(all_relevant_genes)
+    genes_on_panel = set(df.loc[is_not_na & is_valid, 'gene'])
 
-        segment_start = int(row.start)
-        segment_end = int(row.end)
+    # Invalidate any existing gene annotations that are not in our master list of relevant genes.
+    df.loc[is_not_na & ~is_valid, 'gene'] = pd.NA
 
-        query_start = max(0, segment_start - padding)
-        query_end = segment_end + 1
+    # Iterate only over rows that need a gene (originally NA or invalidated).
+    rows_to_annotate = df['gene'].isna()
+    for index, row in df[rows_to_annotate].iterrows():
+        tree = gene_interval_trees.get(row.chromosome)
+        if not tree:
+            continue
 
-        tree = gene_interval_trees.get(chrom)
-        gene_found = None
+        overlaps = tree.overlap(max(0, row.start - padding), row.end + padding)
+        if overlaps:
+            # Filter overlaps to only include genes that are NOT already on the panel.
+            additional_gene_overlaps = {
+                iv for iv in overlaps if iv.data['gene'] not in genes_on_panel
+            }
 
-        if tree:
-            overlaps = tree.overlap(query_start, query_end)
-            if overlaps:
-                gene_found = sorted(overlaps, key=lambda interval: (interval.begin, interval.data['gene']))[0].data[
-                    'gene']
-        gene_annotations.append(gene_found)
+            if additional_gene_overlaps:
+                # If any such "additional" genes are found, pick the first one and annotate.
+                first_overlap = sorted(additional_gene_overlaps, key=lambda i: (i.begin, i.data['gene']))[0]
+                df.at[index, 'gene'] = first_overlap.data['gene']
 
-    df['gene'] = gene_annotations
     return df
 
 
@@ -308,7 +331,7 @@ def prep_ngs_for_plotting(df, chrom_start_map):
     return df
 
 
-def aggregate_data_by_gene(annotated_df):
+def aggregate_data_by_gene(annotated_df, merge_distance=GENE_MERGE_DISTANCE):
     """Aggregates log2 data to gene level based on annotation."""
     if (annotated_df.empty or
             'gene' not in annotated_df.columns or
@@ -327,9 +350,80 @@ def aggregate_data_by_gene(annotated_df):
         log2=('log2', 'median')
     ).reset_index()
 
-    gene_reps['log2'] = gene_reps['log2'].clip(lower=-PLOT_Y_LIM, upper=PLOT_Y_LIM)
-    return gene_reps
+    print(gene_reps)
 
+    if gene_reps.empty:
+        return gene_reps
+
+    # Merge labels of genes that are now close together based on their median positions.
+    gene_reps = gene_reps.sort_values('absolute_position').reset_index(drop=True)
+
+    if merge_distance <= 0:  # If no merging is desired, just clip and return
+        gene_reps['log2'] = gene_reps['log2'].clip(lower=-PLOT_Y_LIM, upper=PLOT_Y_LIM)
+        return gene_reps
+
+    groups = []
+    current_group = []
+    for _, row in gene_reps.iterrows():
+        if not current_group:
+            current_group.append(row)
+            continue
+
+        last_row_in_group = current_group[-1]
+        # Check distance between the median positions of the two genes
+        if (row.absolute_position - last_row_in_group.absolute_position) > merge_distance:
+            groups.append(current_group)
+            current_group = [row]
+        else:
+            current_group.append(row)
+
+    if current_group:
+        groups.append(current_group)
+
+    # Re-aggregate the grouped genes
+    final_reps_data = []
+    for group in groups:
+        if len(group) == 1:
+            final_reps_data.append(group[0].to_dict())
+        else:
+            group_df = pd.DataFrame(group)
+            unique_genes = sorted(list(set(group_df['gene'])))
+            merged_name = _merge_gene_names(unique_genes)
+
+            merged_row = {
+                'gene': merged_name,
+                'case_identifier': group_df['case_identifier'].iloc[0],
+                'absolute_position': group_df['absolute_position'].median(),
+                'log2': group_df['log2'].loc[group_df['log2'].abs().idxmax()]
+            }
+            final_reps_data.append(merged_row)
+
+    if not final_reps_data:
+        return pd.DataFrame()
+
+    merged_gene_reps = pd.DataFrame(final_reps_data)
+    merged_gene_reps['log2'] = merged_gene_reps['log2'].clip(lower=-PLOT_Y_LIM, upper=PLOT_Y_LIM)
+
+    return merged_gene_reps
+
+
+def _merge_gene_names(gene_list):
+    """
+    Merges a list of gene names intelligently.
+    e.g., ['CDKN2A', 'CDKN2B'] becomes 'CDKN2A/B'.
+    """
+    if len(gene_list) <= 1:
+        return '/'.join(gene_list)
+
+    prefix = path.commonprefix(gene_list)
+
+    # If the prefix is trivial, don't shorten, just join
+    if len(prefix) < 3:
+        return '/'.join(gene_list)
+
+    # Keep the first gene name whole, append only suffixes of the rest
+    suffixes = [gene[len(prefix):] for gene in gene_list[1:]]
+    return '/'.join([gene_list[0]] + suffixes)
 
 # --- Plotting Functions ---
 
@@ -345,7 +439,7 @@ def _plot_ngs_scatter(ax, ngs_df_case):
     if len(log2_values) > 1:  # zscore needs at least 2 points
         # zscore returns a numpy array if input is a Series, re-index to match original
         abs_z = np.abs(zscore(log2_values.to_numpy()))
-        calculated_alphas = np.clip(abs_z / 3, 0.1, 1.0) ** 1.75
+        calculated_alphas = np.clip((abs_z / 3) ** 2.25, 0.01, 1.0)
         alphas = pd.Series(calculated_alphas, index=log2_values.index)
     else:
         alphas = pd.Series([0.5], index=log2_values.index)  # Default alpha for a single point
@@ -418,20 +512,23 @@ def _plot_gene_labels(ax, gene_reps_case):
     )
 
     for _, row in valid_gene_reps.iterrows():
+        x = row['absolute_position']
         y, name = row['log2'], row['gene']
-        x_pos = row['absolute_position']
-        offset = 0.25
-        vertical_alignment = 'bottom' if y >= 0 else 'top'
-        y_text = np.clip(y + offset if y >= 0 else y - offset, -PLOT_Y_LIM, PLOT_Y_LIM)
-        ax.text(x_pos, y_text, name, fontsize=9, ha='center', va=vertical_alignment, rotation=90)
+
+        # place label on top for positive y, below for negative y
+        offset = 0.15 if y > 0 else -0.15
+        if abs(y) > PLOT_Y_LIM * 0.75: # invert if text would be too close to the plot limit
+            offset = -1 * offset
+        va = 'bottom' if offset > 0 else 'top'
+        ax.text(x, y + offset, name, fontsize=9, ha='center', va=va, rotation=90)
 
 
 def draw_cnv_plot(case_identifier, df_ngs_case, df_cns_segments, df_gene_reps,
-                  df_chroms, output_dir, output_filename):
+                  df_chroms, arm_boundaries, output_dir, output_filename):
     """Generates and saves the CNV plot for a single case."""
     fig, ax = plt.subplots(figsize=(11, 6))
 
-    _plot_ngs_scatter(ax, df_ngs_case)  # Removed arm_colors_dict
+    _plot_ngs_scatter(ax, df_ngs_case)
     _plot_cns_segments(ax, df_cns_segments, 'darkviolet', '-', 1.5, 'called segment copy number')
     _plot_gene_labels(ax, df_gene_reps)
 
@@ -441,6 +538,11 @@ def draw_cnv_plot(case_identifier, df_ngs_case, df_cns_segments, df_gene_reps,
             c in df_chroms.columns for c in ['chromosome_absolute_start', 'length', 'chromosome']):
         chrom_starts = df_chroms['chromosome_absolute_start']
         ax.vlines(chrom_starts, -PLOT_Y_LIM, PLOT_Y_LIM, color='grey', linestyle='--', linewidth=0.5)
+
+        # Plot p/q arm boundaries
+        if arm_boundaries:
+            ax.vlines(arm_boundaries, -PLOT_Y_LIM, PLOT_Y_LIM, color='grey', linestyle=':', linewidth=0.3)
+
         mids = chrom_starts + df_chroms['length'] / 2
         ax.set_xticks(mids)
         ax.set_xticklabels(df_chroms['chromosome'], rotation=90)
@@ -503,7 +605,7 @@ def main():
     genes_df = load_and_preprocess_relevant_genes(args.genes)
 
     print("Preprocessing static data...")
-    chroms_df, chrom_map = calculate_chromosome_features(cytoband_df)
+    chroms_df, chrom_map, arm_boundaries = calculate_chromosome_features(cytoband_df)
     # arm_map_df and arm_lookup_table creation removed
     gene_trees = build_gene_interval_trees(genes_df)
 
@@ -519,14 +621,13 @@ def main():
         print(f"Error: Failed to load/process {args.cnr_file}. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    cns_filepath = args.cnr_file.with_suffix('.cns')
+    cns_filepath = args.cnr_file.with_suffix('.call.cns')
     print(f"Loading CNS segment data from: {cns_filepath}...")
     cns_segments_df = load_cns_file(cns_filepath, chrom_map, cnr_original_mean, cnr_original_std)
 
     print("Preparing NGS data for plotting...")
     ngs_processed_df = prep_ngs_for_plotting(ngs_raw_df.copy(), chrom_map)
-    # add_segment_arm_classification call removed
-    ngs_processed_df = annotate_segments_with_genes(ngs_processed_df, gene_trees, args.gene_annotation_padding)
+    ngs_processed_df = annotate_segments_with_genes(ngs_processed_df, gene_trees, genes_df, args.gene_annotation_padding)
     ngs_gene_reps = aggregate_data_by_gene(ngs_processed_df)
 
     print(f"NGS Bins: {len(ngs_processed_df)}")
@@ -536,7 +637,7 @@ def main():
     print(f"Generating CNV plot for {case_identifier}...")
     draw_cnv_plot(
         case_identifier, ngs_processed_df, cns_segments_df, ngs_gene_reps,
-        chroms_df, args.output_dir, args.output_filename
+        chroms_df, arm_boundaries, args.output_dir, args.output_filename
     )
     print("Done.")
 
