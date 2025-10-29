@@ -16,12 +16,6 @@ from scipy.stats import zscore
 PLOT_Y_LIM = 7.5
 GENE_MERGE_DISTANCE = 2_000_000
 
-SEX_PRED_MALE_Z_HIGH = -1.5
-SEX_PRED_MALE_Z_LOW = 0.0
-
-SEX_PRED_FEMALE_Z_HIGH = -9.0
-SEX_PRED_FEMALE_Z_LOW = 0.0
-
 # Default paths
 DEFAULT_CYTOBAND_PATH = Path('input/static/cytoBand.txt')
 DEFAULT_RELEVANT_GENES_PATH = Path('input/static/relevant_genes.csv')
@@ -429,69 +423,6 @@ def _merge_gene_names(gene_list):
     return '/'.join([gene_list[0]] + suffixes)
 
 
-def predict_sex(ngs_df):
-    """
-    Predicts sex using a self-calibrating, linear scoring system based on the
-    relative z-scores of the X and Y chromosomes.
-
-    This model is highly portable as it uses no fixed log2 thresholds. It
-    calculates a "male score" based on the X chromosome's z-score and a
-    "female score" based on the Y chromosome's z-score, then selects the
-    hypothesis with the higher score.
-    """
-    if ngs_df.empty:
-        return "unknown", 0.0
-
-    # Ensure chromosome names are consistent for selection
-    df = ngs_df.copy()
-    df['chromosome'] = df['chromosome'].str.lower().str.replace('chr', '')
-
-    # Isolate chromosome data using string names
-    autosomal_bins = df[df['chromosome'].isin([str(i) for i in range(1, 23)])]
-    x_bins = df[df['chromosome'] == 'x']
-    y_bins = df[df['chromosome'] == 'y']
-
-    if autosomal_bins.empty or x_bins.empty or y_bins.empty:
-        print("Warning: Missing autosomal, X, or Y data. Cannot predict sex.", file=sys.stderr)
-        return "unknown", 0.0
-
-    # Calculate the sample's unique baseline statistics
-    median_auto = autosomal_bins['log2'].median()
-    autosomal_std = autosomal_bins['log2'].std()
-
-    if pd.isna(autosomal_std) or autosomal_std < 1e-9:
-        print("Warning: Autosomal standard deviation is zero. Cannot predict sex.", file=sys.stderr)
-        return "unknown", 0.0
-
-    median_x = x_bins['log2'].median()
-    median_y = y_bins['log2'].median()
-
-    # Calculate z-scores relative to the sample's own autosomes
-    z_score_x = (median_x - median_auto) / autosomal_std
-    z_score_y = (median_y - median_auto) / autosomal_std
-
-    # --- Calculate Male Score (0.0 to 1.0) ---
-    male_range = SEX_PRED_MALE_Z_LOW - SEX_PRED_MALE_Z_HIGH
-    male_score = (SEX_PRED_MALE_Z_LOW - z_score_x) / male_range
-    male_score = np.clip(male_score, 0.0, 1.0)
-
-    # --- Calculate Female Score (0.0 to 1.0) ---
-    female_range = SEX_PRED_FEMALE_Z_LOW - SEX_PRED_FEMALE_Z_HIGH
-    female_score = (SEX_PRED_FEMALE_Z_LOW - z_score_y) / female_range
-    female_score = np.clip(female_score, 0.0, 1.0)
-
-    print(f"Sex prediction scores: Female={female_score:.2f}, Male={male_score:.2f}")
-
-    # --- Decision and Confidence ---
-    if male_score > female_score:
-        prediction = "male"
-    else:
-        prediction = "female"
-
-    confidence = abs(male_score - female_score)
-
-    return prediction, np.clip(confidence, 0.0, 1.0)
-
 def _plot_ngs_scatter(ax, ngs_df_case):
     """Plots individual NGS bins. Colors based on log2 value (gain/loss/neutral)."""
     if ngs_df_case.empty or 'log2' not in ngs_df_case.columns or 'absolute_start' not in ngs_df_case.columns:
@@ -587,8 +518,7 @@ def _plot_gene_labels(ax, gene_reps_case):
 
 
 def draw_cnv_plot(case_identifier, df_ngs_case, df_cns_segments, df_gene_reps,
-                  df_chroms, arm_boundaries, output_dir, output_filename, predicted_sex=None,
-                  confidence_score=None):
+                  df_chroms, arm_boundaries, output_dir, output_filename):
     """Generates and saves the CNV plot for a single case."""
     fig, ax = plt.subplots(figsize=(11, 6))
 
@@ -634,16 +564,6 @@ def draw_cnv_plot(case_identifier, df_ngs_case, df_cns_segments, df_gene_reps,
 
     # Set the main title
     plt.suptitle(f'CNV profile for {case_identifier}', fontsize=14)
-
-    # Add predicted sex as a subtitle below the main title
-    subtitle_text = ""
-    if predicted_sex and predicted_sex != 'unknown':
-        subtitle_text = f'sex prediction: {predicted_sex}'
-        if confidence_score is not None:
-            subtitle_text += f' ({confidence_score:.0%} confidence)'
-
-    # Use plt.title() to create the subtitle
-    plt.title(subtitle_text, fontsize=9)
 
     ax.grid(False)
     ax.legend().set_visible(False)
@@ -698,10 +618,6 @@ def main():
         print(f"Error: Failed to load/process {args.cnr_file}. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    # Predict sex from the normalized NGS data
-    predicted_sex, confidence_score = predict_sex(ngs_raw_df)
-    print(f"Predicted sex for {case_identifier}: {predicted_sex} (Confidence: {confidence_score:.1%})")
-
     if args.cns_path:
         cns_filename = args.cnr_file.with_suffix('.call.cns').name
         cns_filepath = args.cns_path / cns_filename
@@ -723,8 +639,7 @@ def main():
     print(f"Generating CNV plot for {case_identifier}...")
     draw_cnv_plot(
         case_identifier, ngs_processed_df, cns_segments_df, ngs_gene_reps,
-        chroms_df, arm_boundaries, args.output_dir, args.output_filename,
-        predicted_sex, confidence_score
+        chroms_df, arm_boundaries, args.output_dir, args.output_filename
     )
     print("Done.")
 
